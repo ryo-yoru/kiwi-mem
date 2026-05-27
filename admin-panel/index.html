@@ -544,44 +544,45 @@ async function searchMemories(){
   catch(e){document.getElementById('memories-list').innerHTML=`<p style="color:var(--red)">搜索失败</p>`;}
 }
 function renderMemories(mems,total){
-  if(!mems.length){
-    document.getElementById('memories-list').innerHTML='<p style="color:var(--text-3)">这一页没有记忆。</p>';
-    // 即使没数据也要保留分页,让用户能回到上一页
-    const tp=Math.max(1,Math.ceil(total/MEM_LIMIT));
-    let pg='';
-    if(memPage>0)pg+=`<button class="btn btn-sm btn-secondary" onclick="memPage=0;loadMemories()">回到第一页</button>`;
-    if(memPage>0)pg+=`<button class="btn btn-sm btn-secondary" onclick="memPage--;loadMemories()">上一页</button>`;
-    pg+=`<span>${memPage+1}/${tp}</span>`;
-    document.getElementById('mem-pagination').innerHTML=pg;
-    return;
-  }
+  const listEl=document.getElementById('memories-list');
   const TRUNC=200;
-  document.getElementById('memories-list').innerHTML=mems.map(m=>{
-    const full=m.content||'';
-    const truncated=full.length>TRUNC;
-    const initialHtml=esc(truncated?full.slice(0,TRUNC)+'…':full).replace(/\n/g,'<br>');
-    return `
-    <div class="mem-card">
-      ${m.title?`<div class="mem-title">${esc(m.title)}</div>`:''}
-      <div class="mem-content" id="mem-c-${m.id}" data-full="${escA(full)}" data-trunc="${escA(full.slice(0,TRUNC))}" data-expanded="0" style="white-space:normal;">${initialHtml}</div>
-      <div class="mem-footer" style="margin-top:8px;">
-        <div class="mem-meta">
-          <span class="badge ${m.importance>=8?'b-high':m.importance>=5?'b-mid':'b-low'}">${m.importance}</span>
-          ${m.is_permanent?'<span class="badge b-lock">锁定</span>':''}
-          ${m.category_name?`<span class="badge" style="background:var(--bg);color:var(--text-3);">${esc(m.category_name)}</span>`:''}
+  if(!mems.length){
+    listEl.innerHTML='<p style="color:var(--text-3)">这一页没有记忆。</p>';
+  }else{
+    listEl.innerHTML=mems.map(m=>{
+      const full=m.content||'';
+      const truncated=full.length>TRUNC;
+      const initialHtml=esc(truncated?full.slice(0,TRUNC)+'…':full).replace(/\n/g,'<br>');
+      return `
+      <div class="mem-card">
+        ${m.title?`<div class="mem-title">${esc(m.title)}</div>`:''}
+        <div class="mem-content" id="mem-c-${m.id}" data-full="${escA(full)}" data-trunc="${escA(full.slice(0,TRUNC))}" data-expanded="0" style="white-space:normal;">${initialHtml}</div>
+        <div class="mem-footer" style="margin-top:8px;">
+          <div class="mem-meta">
+            <span class="badge ${m.importance>=8?'b-high':m.importance>=5?'b-mid':'b-low'}">${m.importance}</span>
+            ${m.is_permanent?'<span class="badge b-lock">锁定</span>':''}
+            ${m.category_name?`<span class="badge" style="background:var(--bg);color:var(--text-3);">${esc(m.category_name)}</span>`:''}
+          </div>
+          <div class="mem-actions">
+            <span style="font-size:10px;color:var(--text-3);margin-right:6px;">${(m.created_at||'').slice(0,10)}</span>
+            ${truncated?`<button class="btn btn-sm btn-secondary" id="mem-toggle-${m.id}" onclick="toggleMemExpand(${m.id})">展开</button>`:''}
+            <button class="btn btn-sm btn-secondary" onclick="toggleLock(${m.id})" title="${m.is_permanent?'解锁':'锁定'}">${m.is_permanent?'解锁':'锁定'}</button>
+            <button class="btn btn-sm btn-secondary" onclick="editMemory(${m.id})">编辑</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteMemory(${m.id})">删除</button>
+          </div>
         </div>
-        <div class="mem-actions">
-          <span style="font-size:10px;color:var(--text-3);margin-right:6px;">${(m.created_at||'').slice(0,10)}</span>
-          ${truncated?`<button class="btn btn-sm btn-secondary" id="mem-toggle-${m.id}" onclick="toggleMemExpand(${m.id})">展开</button>`:''}
-          <button class="btn btn-sm btn-secondary" onclick="toggleLock(${m.id})" title="${m.is_permanent?'解锁':'锁定'}">${m.is_permanent?'解锁':'锁定'}</button>
-          <button class="btn btn-sm btn-secondary" onclick="editMemory(${m.id})">编辑</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteMemory(${m.id})">删除</button>
-        </div>
-      </div>
-    </div>`;
-  }).join('');
-  const tp=Math.ceil(total/MEM_LIMIT);
-  if(tp>1){let pg='';if(memPage>0)pg+=`<button class="btn btn-sm btn-secondary" onclick="memPage--;loadMemories()">上一页</button>`;pg+=`<span>${memPage+1}/${tp}</span>`;if(memPage<tp-1)pg+=`<button class="btn btn-sm btn-secondary" onclick="memPage++;loadMemories()">下一页</button>`;document.getElementById('mem-pagination').innerHTML=pg;}else{document.getElementById('mem-pagination').innerHTML='';}
+      </div>`;
+    }).join('');
+  }
+  // 翻页栏始终显示(只有 1 页也显示位置指示),边界按钮置灰
+  const tp=Math.max(1,Math.ceil(total/MEM_LIMIT));
+  const prevDisabled=memPage<=0;
+  const nextDisabled=memPage>=tp-1;
+  const dimStyle=(d)=>d?'style="opacity:0.35;pointer-events:none;"':'';
+  document.getElementById('mem-pagination').innerHTML=
+    `<button class="btn btn-sm btn-secondary" ${dimStyle(prevDisabled)} onclick="memPage--;loadMemories()">上一页</button>`+
+    `<span style="padding:0 6px;">${memPage+1} / ${tp}</span>`+
+    `<button class="btn btn-sm btn-secondary" ${dimStyle(nextDisabled)} onclick="memPage++;loadMemories()">下一页</button>`;
 }
 function toggleMemExpand(id){
   const c=document.getElementById('mem-c-'+id);
