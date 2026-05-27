@@ -1976,8 +1976,12 @@ async def debug_memories(q: str = "", limit: int = 20, category_id: int = None,
                 limit=limit, category_id=category_id,
                 offset=offset, sort=sort, min_importance=min_importance,
             )
-        
-        total = await get_all_memories_count()
+
+        # 用同口径过滤后的总数,保证前端分页 totalPages 准确
+        if q:
+            total = len(memories)  # 搜索结果按当前列表算
+        else:
+            total = await get_all_memories_count(min_importance=min_importance, category_id=category_id)
         
         return {
             "total_memories": total,

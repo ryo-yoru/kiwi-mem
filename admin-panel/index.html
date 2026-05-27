@@ -544,7 +544,17 @@ async function searchMemories(){
   catch(e){document.getElementById('memories-list').innerHTML=`<p style="color:var(--red)">搜索失败</p>`;}
 }
 function renderMemories(mems,total){
-  if(!mems.length){document.getElementById('memories-list').innerHTML='<p style="color:var(--text-3)">无记忆。</p>';document.getElementById('mem-pagination').innerHTML='';return;}
+  if(!mems.length){
+    document.getElementById('memories-list').innerHTML='<p style="color:var(--text-3)">这一页没有记忆。</p>';
+    // 即使没数据也要保留分页,让用户能回到上一页
+    const tp=Math.max(1,Math.ceil(total/MEM_LIMIT));
+    let pg='';
+    if(memPage>0)pg+=`<button class="btn btn-sm btn-secondary" onclick="memPage=0;loadMemories()">回到第一页</button>`;
+    if(memPage>0)pg+=`<button class="btn btn-sm btn-secondary" onclick="memPage--;loadMemories()">上一页</button>`;
+    pg+=`<span>${memPage+1}/${tp}</span>`;
+    document.getElementById('mem-pagination').innerHTML=pg;
+    return;
+  }
   const TRUNC=200;
   document.getElementById('memories-list').innerHTML=mems.map(m=>{
     const full=m.content||'';

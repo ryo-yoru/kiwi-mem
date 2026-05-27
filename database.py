@@ -60,9 +60,40 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/comp
 
 
 def _get_embedding_url() -> str:
-    """从 API_BASE_URL 推导 embedding endpoint"""
+    """从 API_BASE_URL 推导 embedding endpoint(env fallback)"""
     base = API_BASE_URL.split("/chat/completions")[0].rstrip("/")
     return f"{base}/embeddings"
+
+
+def _truncate_for_embedding(text: str, max_chars: int = 400) -> str:
+    """
+    embedding 模型有 token 上限(BAAI/bge 系列约 512 tokens)。
+    长内容截断到 max_chars(默认 400 中文字),前段语义足够代表整体。
+    """
+    if not text:
+        return ""
+    return text[:max_chars] if len(text) > max_chars else text
+
+
+async def _resolve_embedding_endpoint():
+    """
+    embedding 服务的实际 url/key/model — 优先读 DB 配置,fallback 到 env。
+    用户大概率是 DeepSeek 做 chat + SiliconFlow 做 embedding 的分离配置。
+    """
+    cfg_url = ""
+    cfg_key = ""
+    cfg_model = ""
+    try:
+        from config import get_config as _gc
+        cfg_url = (await _gc("embedding_api_url")) or ""
+        cfg_key = (await _gc("embedding_api_key")) or ""
+        cfg_model = (await _gc("default_embedding_model")) or ""
+    except Exception:
+        pass
+    url = cfg_url or _get_embedding_url()
+    key = cfg_key or API_KEY
+    model = cfg_model or EMBEDDING_MODEL
+    return url, key, model
 
 
 # ============================================================
@@ -581,39 +612,40 @@ async def init_tables():
 
 async def get_embedding(text: str) -> Optional[List[float]]:
     """
-    调用 OpenRouter Embedding API 生成向量
-    
-    使用与聊天相同的 API_KEY，接口完全兼容 OpenAI 格式
-    失败时返回 None（触发降级搜索）
+    调用 embedding API 生成向量。
+    优先读 DB 配置 embedding_api_url / embedding_api_key / default_embedding_model,
+    fallback 到 env 的 API_BASE_URL / API_KEY / EMBEDDING_MODEL。
+    失败时返回 None（触发降级搜索）。
     """
-    if not API_KEY:
-        print("⚠️  API_KEY 未设置，无法生成 embedding")
+    url, key, model = await _resolve_embedding_endpoint()
+    if not key:
+        print("⚠️  embedding key 未设置，无法生成 embedding")
         return None
-    
-    url = _get_embedding_url()
-    
+
+    # 截断超长内容以适配 embedding 模型的 token 上限
+    text = _truncate_for_embedding(text)
+
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 url,
                 headers={
-                    "Authorization": f"Bearer {API_KEY}",
+                    "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": EMBEDDING_MODEL,
+                    "model": model,
                     "input": text,
                 },
             )
-            
+
             if resp.status_code == 200:
                 data = resp.json()
-                embedding = data["data"][0]["embedding"]
-                return embedding
+                return data["data"][0]["embedding"]
             else:
-                print(f"⚠️  Embedding API 返回 {resp.status_code}: {resp.text[:200]}")
+                print(f"⚠️  Embedding API({url}) 返回 {resp.status_code}: {resp.text[:200]}")
                 return None
-                
+
     except Exception as e:
         print(f"⚠️  Embedding 生成失败: {e}")
         return None
@@ -624,25 +656,29 @@ async def get_embeddings_batch(texts: List[str]) -> List[Optional[List[float]]]:
     批量生成 embedding（OpenRouter 支持批量输入）
     返回与 texts 等长的列表，失败的位置为 None
     """
-    if not API_KEY or not texts:
+    if not texts:
+        return []
+    url, key, model = await _resolve_embedding_endpoint()
+    if not key:
         return [None] * len(texts)
-    
-    url = _get_embedding_url()
-    
+
+    # 每段独立截断,避免某一条超长拖垮整批
+    texts = [_truncate_for_embedding(t) for t in texts]
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 url,
                 headers={
-                    "Authorization": f"Bearer {API_KEY}",
+                    "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": EMBEDDING_MODEL,
+                    "model": model,
                     "input": texts,
                 },
             )
-            
+
             if resp.status_code == 200:
                 data = resp.json()
                 # API 返回的 data 列表按 index 排序
@@ -652,9 +688,9 @@ async def get_embeddings_batch(texts: List[str]) -> List[Optional[List[float]]]:
                     results[idx] = item["embedding"]
                 return results
             else:
-                print(f"⚠️  批量 Embedding API 返回 {resp.status_code}: {resp.text[:200]}")
+                print(f"⚠️  批量 Embedding API({url}) 返回 {resp.status_code}: {resp.text[:200]}")
                 return [None] * len(texts)
-                
+
     except Exception as e:
         print(f"⚠️  批量 Embedding 生成失败: {e}")
         return [None] * len(texts)
@@ -1678,10 +1714,24 @@ async def get_recent_memories(limit: int = 20, category_id: int = None, project_
         return await conn.fetch(sql, *params)
 
 
-async def get_all_memories_count():
+async def get_all_memories_count(min_importance: int = None, category_id: int = None):
+    """
+    可查询的记忆总数(与 get_recent_memories 同口径,过滤掉 digested/dream_deleted
+    和过期记忆;可叠加重要度/分类过滤,保证分页 totalPages 计算准确)
+    """
     pool = await get_pool()
+    sql = """SELECT COUNT(*) as cnt FROM memories m
+             WHERE COALESCE(m.memory_type, 'fragment') NOT IN ('digested', 'dream_deleted')
+               AND (m.valid_until IS NULL OR m.valid_until > NOW())"""
+    params: list = []
+    if category_id is not None:
+        params.append(category_id)
+        sql += f" AND m.category_id = ${len(params)}"
+    if min_importance is not None:
+        params.append(int(min_importance))
+        sql += f" AND m.importance >= ${len(params)}"
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT COUNT(*) as cnt FROM memories")
+        row = await conn.fetchrow(sql, *params)
         return row["cnt"]
 
 
