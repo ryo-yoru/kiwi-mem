@@ -18,7 +18,7 @@ import uuid
 import asyncio
 import httpx
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -40,6 +40,9 @@ from database import (
     sync_upsert_messages, sync_get_projects, sync_upsert_project, sync_delete_project, sync_import_all,
     # v4.2 提醒系统
     create_reminder, get_reminders, update_reminder, delete_reminder, get_due_reminders, fire_reminder,
+    # v6.1 聊天存档
+    import_chat_archive, search_chat_archive, get_chat_archive_stats,
+    delete_chat_archive_source, rename_chat_archive_source,
 )
 from config import (
     get_all_config, set_config, get_config, get_config_int, get_config_bool,
@@ -899,9 +902,13 @@ async def api_status():
 
 @app.get("/admin")
 async def admin_panel():
-    """重定向到记忆花园前端"""
-    from fastapi.responses import RedirectResponse
-    return {"status": "running", "service": "kiwi-mem"}
+    """管理面板"""
+    import pathlib
+    html_path = pathlib.Path(__file__).parent / "admin-panel" / "index.html"
+    if html_path.exists():
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return {"message": "管理面板文件不存在，请确认 admin-panel/index.html 已部署"}
 
 
 @app.get("/v1/models")
@@ -1946,13 +1953,15 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
 # ============================================================
 
 @app.get("/debug/memories")
-async def debug_memories(q: str = "", limit: int = 20, category_id: int = None):
-    """查看和搜索记忆（支持分类筛选）"""
+async def debug_memories(q: str = "", limit: int = 20, category_id: int = None,
+                          offset: int = 0, sort: str = "recent", min_importance: int = None):
+    """查看和搜索记忆（支持分类筛选、分页、排序、重要度筛选）"""
     if not await get_memory_enabled():
         return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
 
     # 限制查询范围，防止过大请求消耗资源
     limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     try:
         if q:
@@ -1960,8 +1969,13 @@ async def debug_memories(q: str = "", limit: int = 20, category_id: int = None):
             # 搜索结果如需按分类筛选
             if category_id is not None:
                 memories = [m for m in memories if m.get("category_id") == category_id]
+            if min_importance is not None:
+                memories = [m for m in memories if m.get("importance", 0) >= int(min_importance)]
         else:
-            memories = await get_recent_memories(limit=limit, category_id=category_id)
+            memories = await get_recent_memories(
+                limit=limit, category_id=category_id,
+                offset=offset, sort=sort, min_importance=min_importance,
+            )
         
         total = await get_all_memories_count()
         
@@ -1981,6 +1995,7 @@ async def debug_memories(q: str = "", limit: int = 20, category_id: int = None):
                     "category_color": m.get("category_color", ""),
                     "source": m.get("source", "ai_extracted"),
                     "resolution": m.get("resolution", 1.0),
+                    "is_permanent": m.get("is_permanent", False),
                 }
                 for m in memories
             ],
@@ -3739,6 +3754,15 @@ async def api_sync_export():
             val = await get_config(key)
             settings[key] = val or ""
 
+        # 日历页面（日/周/月）
+        async with pool.acquire() as conn:
+            cal_rows = await conn.fetch("""
+                SELECT date, type, title, diary, summary, digest, keywords, sections, model_used, created_at, updated_at
+                FROM calendar_pages
+                ORDER BY date DESC
+            """)
+        calendar_pages = [_serialize_datetimes(dict(r)) for r in cal_rows]
+
         # 打包 zip
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -3747,6 +3771,46 @@ async def api_sync_export():
             zf.writestr("memories.json", json.dumps(memories, ensure_ascii=False, indent=2))
             zf.writestr("config.json", json.dumps(config_flat, ensure_ascii=False, indent=2))
             zf.writestr("settings.json", json.dumps(settings, ensure_ascii=False, indent=2))
+            zf.writestr("calendar_pages.json", json.dumps(calendar_pages, ensure_ascii=False, indent=2))
+
+            # 日页面：导出为可直接放进 Obsidian 的 .md 文件
+            for p in calendar_pages:
+                ptype = p.get("type", "day")
+                date_str = p.get("date", "")
+                if not date_str:
+                    continue
+                title = p.get("title") or ""
+                diary = p.get("diary") or ""
+                summary = p.get("summary") or ""
+                digest = p.get("digest") or ""
+                keywords = p.get("keywords") or []
+                if isinstance(keywords, str):
+                    try:
+                        keywords = json.loads(keywords)
+                    except Exception:
+                        keywords = []
+
+                # 构造 Obsidian 友好的 frontmatter + 正文
+                fm_lines = ["---"]
+                fm_lines.append(f"date: {date_str}")
+                fm_lines.append(f"type: {ptype}")
+                if title:
+                    fm_lines.append(f"title: {title}")
+                if keywords:
+                    fm_lines.append(f"tags: [{', '.join(str(k) for k in keywords[:20])}]")
+                fm_lines.append("---")
+                fm_lines.append("")
+                if title:
+                    fm_lines.append(f"# {title}")
+                    fm_lines.append("")
+                # 主体优先级：diary > digest > summary
+                body = diary or digest or summary or "(空)"
+                fm_lines.append(body)
+                md_content = "\n".join(fm_lines)
+
+                # 按类型放进不同目录
+                folder = {"day": "day-pages", "week": "week-pages", "month": "month-pages"}.get(ptype, "pages")
+                zf.writestr(f"{folder}/{date_str}.md", md_content)
         buf.seek(0)
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -3764,13 +3828,15 @@ async def api_sync_export():
 
 
 def _serialize_datetimes(obj):
-    """递归将 datetime 对象转为 ISO 字符串"""
-    from datetime import datetime as _dt
+    """递归将 datetime/date 对象转为 ISO 字符串"""
+    from datetime import datetime as _dt, date as _date
     if isinstance(obj, dict):
         return {k: _serialize_datetimes(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_serialize_datetimes(v) for v in obj]
     elif isinstance(obj, _dt):
+        return obj.isoformat()
+    elif isinstance(obj, _date):
         return obj.isoformat()
     return obj
 
@@ -3963,11 +4029,85 @@ async def api_delete_reminder(rid: str):
 
 
 # ============================================================
+# 聊天存档 — 独立文本搜索
+# ============================================================
+
+@app.post("/archive/upload")
+async def api_archive_upload(
+    file: UploadFile = File(...),
+    source: str = Form(default=""),
+):
+    """
+    上传 md 聊天记录（按 source 替换模式）
+    - source 可选，没传则从文件头 '# 标题' 自动提取
+    - 同名 source 会覆盖该窗口的旧数据，不影响其他窗口
+    """
+    try:
+        raw = await file.read()
+        text = raw.decode("utf-8")
+        result = await import_chat_archive(text, source=source if source else None)
+        return result
+    except UnicodeDecodeError:
+        return {"error": "文件编码错误，请使用 UTF-8"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/archive/search")
+async def api_archive_search(
+    q: str = "",
+    include_thinking: bool = False,
+    limit: int = 5,
+    source: str = "",
+):
+    """关键词搜索聊天存档。source 留空 = 跨所有窗口搜"""
+    if not q.strip():
+        return {"error": "请提供搜索关键词", "results": []}
+    limit = max(1, min(limit, 10))
+    results = await search_chat_archive(
+        q, include_thinking=include_thinking, limit=limit,
+        source=source if source else None,
+    )
+    return {"query": q, "include_thinking": include_thinking, "source": source or None, "results": results}
+
+
+@app.get("/archive/stats")
+async def api_archive_stats():
+    """聊天存档统计：总量 + 每个对话窗口的明细"""
+    return await get_chat_archive_stats()
+
+
+@app.delete("/archive/source/{source}")
+async def api_archive_delete_source(source: str):
+    """删除某个对话窗口的所有存档"""
+    if not source.strip():
+        return {"error": "source 不能为空"}
+    deleted = await delete_chat_archive_source(source)
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.put("/archive/source/{source}/rename")
+async def api_archive_rename_source(source: str, req: Request):
+    """重命名某个对话窗口。如果新名称已存在会合并到该窗口下"""
+    try:
+        body = await req.json()
+        new_name = (body.get("new_source") or "").strip()
+        if not new_name:
+            return {"error": "new_source 不能为空"}
+        result = await rename_chat_archive_source(source, new_name)
+        if "error" in result:
+            return result
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
 # 挂载 MCP Server（Streamable HTTP）
 # ============================================================
 #
 # 记忆系统：/memory/mcp
-#   工具：search_memory, save_memory, get_recent, trigger_digest
+#   工具：search_memory, save_memory, get_recent, trigger_digest, lock_memory, unlock_memory, search_archive
 
 app.mount("/memory", get_mcp_app())
 app.mount("/calendar", get_calendar_mcp_app())

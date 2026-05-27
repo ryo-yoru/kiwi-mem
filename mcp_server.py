@@ -3,8 +3,8 @@ MCP Server — kiwi-mem 记忆系统的 MCP 接口层
 ==========================================================
 按功能域拆分为独立模块，客户端只连需要的模块，不用的不占 token。
 
-模块一：记忆碎片（/memory/mcp）— 6 个工具
-  search_memory, save_memory, get_recent, trigger_digest, lock_memory, unlock_memory
+模块一：记忆碎片（/memory/mcp）— 7 个工具
+  search_memory, save_memory, get_recent, trigger_digest, lock_memory, unlock_memory, search_archive
 
 模块二：日历 + Dream（/calendar/mcp）— 11 个工具
   get_day_page, get_calendar_range, save_calendar_page,
@@ -44,13 +44,14 @@ mcp_memory = FastMCP("Memory Garden", stateless_http=True)
 @mcp_memory.tool()
 async def search_memory(query: str, limit: int = 10) -> str:
     """
-    搜索记忆 — 用自然语言描述你想找的内容，向量语义搜索会返回最相关的记忆。
+    搜索记忆碎片（语义搜索）— 在 AI 提炼过的记忆库中搜索。
+
+    适用场景：找"关于某个主题的记忆"，比如"用户的兴趣爱好"、"上周的情绪状态"。
+    不适用：找原始对话原文/原话 → 请用 search_archive。
 
     参数：
-    - query: 搜索关键词或自然语言描述，比如"用户的健康记录"、"上周聊了什么"
+    - query: 自然语言描述，比如"健康记录"、"喜欢的音乐"
     - limit: 返回条数上限（默认10，最大50）
-
-    返回匹配的记忆列表，每条包含标题、内容、重要度、日期。
     """
     if limit > 50:
         limit = 50
@@ -260,6 +261,110 @@ async def unlock_memory(memory_id: int) -> str:
 
     except Exception as e:
         return f"解锁出错：{str(e)}"
+
+
+@mcp_memory.tool()
+async def search_archive(query: str, include_thinking: bool = False, source: str = "") -> str:
+    """
+    搜索原始对话记录（关键词精确匹配）— 在朝朝和暮的所有聊天存档中搜索。
+
+    适用场景：找某句原话、找某个具体对话片段、找"我们那天说过什么"。
+    这是精确关键词搜索（ILIKE），不是语义搜索。多个词空格分隔取交集。
+
+    存档按对话窗口（source）分别存储。默认跨所有窗口搜索；如果朝朝指定了某个对话，
+    可以传 source 参数只搜那一个窗口。
+
+    参数：
+    - query: 关键词，比如"早餐课"、"灯笼 树莓派"
+    - include_thinking: 是否也搜暮的思考链（默认 False，只搜正文）
+    - source: 对话窗口名（可选，留空 = 搜所有窗口）
+
+    返回最多 5 条匹配，每条包含日期、角色（朝朝/暮）、对话窗口和上下文片段。
+    """
+    if not query.strip():
+        return "请提供搜索关键词"
+
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=GATEWAY_HEADERS) as client:
+            params = {"q": query, "include_thinking": str(include_thinking).lower(), "limit": 5}
+            if source.strip():
+                params["source"] = source.strip()
+            resp = await client.get(f"{GATEWAY_BASE}/archive/search", params=params)
+            data = resp.json()
+
+        if "error" in data:
+            return f"搜索出错：{data['error']}"
+
+        results = data.get("results", [])
+        if not results:
+            scope = f"窗口「{source}」" if source else "所有窗口"
+            return f"在{scope}中没有找到包含「{query}」的对话记录。"
+
+        lines = [f"找到 {len(results)} 条匹配：\n"]
+        for r in results:
+            role_label = "朝朝" if r["role"] == "human" else "暮"
+            in_tag = "（思考链）" if r.get("matched_in") == "thinking" else ""
+            src_tag = f"〔{r.get('source','?')}〕" if r.get("source") else ""
+            lines.append(f"【{r['date']}】{src_tag}{role_label}{in_tag}：\n{r['snippet']}\n")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"搜索出错：{str(e)}"
+
+
+@mcp_memory.tool()
+async def check_conversation_health(source: str = "") -> str:
+    """
+    查看对话窗口的健康度（接近压缩的程度）。
+
+    用途：朝朝在 Claude 桌面无法看到 token 用量，这个工具帮她（或暮自己）
+    估算当前对话窗口离压缩还有多远，以便提前把重要的东西保存到记忆里。
+
+    参数：
+    - source: 对话窗口名（留空 = 列出所有窗口的概况）
+
+    返回每个窗口的估算 token 数、上下文占用比例、健康状态、活跃天数和消息频率。
+    状态分级：healthy(<50%) / warm(<70%) / warning(<85%) / critical(>=85%)
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=GATEWAY_HEADERS) as client:
+            resp = await client.get(f"{GATEWAY_BASE}/archive/stats")
+            data = resp.json()
+
+        sources = data.get("sources", [])
+        if not sources:
+            return "暂时没有存档窗口。"
+
+        if source.strip():
+            target = source.strip()
+            sources = [s for s in sources if s["source"] == target]
+            if not sources:
+                return f"找不到窗口「{target}」。可以先用 search_archive 看看有哪些窗口。"
+
+        limit = data.get("context_limit", 1000000)
+        lines = [f"对话窗口健康度（上下文容量按 {limit:,} tokens 估算）：\n"]
+        status_emoji = {
+            "healthy": "🟢",
+            "warm": "🟡",
+            "warning": "🟠",
+            "critical": "🔴",
+        }
+        for s in sources:
+            emoji = status_emoji.get(s["status"], "")
+            lines.append(
+                f"{emoji} 「{s['source']}」"
+                f"\n  消息: {s['count']} 条 · 估算 {s['est_tokens']:,} tokens"
+                f"\n  占用: {s['usage_pct']}% · 状态: {s['status']}"
+                f"\n  活跃: {s['earliest']} ~ {s['latest']} ({s['days_active']} 天，平均 {s['msgs_per_day']} 条/天)\n"
+            )
+
+        if any(s["status"] in ("warning", "critical") for s in sources):
+            lines.append("⚠️  建议把关键的对话片段或情绪节点尽快保存到记忆库（save_memory），避免压缩后丢失。")
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"获取健康度出错：{str(e)}"
 
 
 # ============================================================

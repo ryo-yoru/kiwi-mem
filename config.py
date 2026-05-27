@@ -76,6 +76,9 @@ CONFIG_SCHEMA = {
     "search_engine":         ("SEARCH_ENGINE",           "",     "搜索引擎",          "text"),
     "search_api_key":        ("SEARCH_API_KEY",          "",     "搜索 API Key",      "text"),
     "search_max_results":    ("SEARCH_MAX_RESULTS",      "5",    "搜索结果条数",      "int"),
+    # 存档健康度（v6.3）
+    "archive_context_limit": ("ARCHIVE_CONTEXT_LIMIT",   "500000", "对话窗口有效上下文(tokens,根据观测调)", "int"),
+    "archive_overhead_factor": ("ARCHIVE_OVERHEAD_FACTOR", "2.0",   "工具+系统开销系数(1.0=不算 / 2.0=普通 / 3.0=重度MCP)", "float"),
     # 云端同步 — 用户/助手配置（v4.1）
     "user_avatar":           ("",                        "",     "用户头像",          "text"),
     "user_nickname":         ("",                        "",     "用户昵称",          "text"),

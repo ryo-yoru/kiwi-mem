@@ -552,7 +552,27 @@ async def init_tables():
             await conn.execute("ALTER TABLE memories ADD COLUMN resolution FLOAT DEFAULT 1.0")
             print("✅ memories 表已添加 resolution 列（记忆软化系统）")
 
-    print("✅ 数据库表结构已就绪（v5.9 记忆软化）")
+        # v6.1：聊天存档表（独立文本搜索模块）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_archive (
+                id          SERIAL PRIMARY KEY,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                thinking    TEXT,
+                message_ts  TIMESTAMPTZ NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'default',
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        # v6.2 迁移：给已有表加 source 列
+        await conn.execute("""
+            ALTER TABLE chat_archive ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'default';
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_archive_source ON chat_archive(source);
+        """)
+
+    print("✅ 数据库表结构已就绪（v6.2 多源聊天存档）")
 
 
 # ============================================================
@@ -1610,19 +1630,24 @@ async def _keyword_search(query: str, limit: int = 10, heat_params: dict = None,
 # 常用查询
 # ============================================================
 
-async def get_recent_memories(limit: int = 20, category_id: int = None, project_id: str = None):
+async def get_recent_memories(limit: int = 20, category_id: int = None, project_id: str = None,
+                              offset: int = 0, sort: str = "recent", min_importance: int = None):
     """
     最近记忆。
     project_id 语义（保持与本函数原有调用方一致）：
       - 传值 → 只看该项目的记忆（m.project_id = project_id）
       - 不传 / 空 → 不过滤项目（全部）
+    sort: "recent"(默认,按创建时间倒序) / "importance" / "heat"
+    offset: 分页偏移
+    min_importance: 仅显示重要度 >= 该值的记忆
     """
     pool = await get_pool()
     base_select = """SELECT m.id, m.content, m.importance, m.created_at,
                   COALESCE(m.title, '') as title, COALESCE(m.memory_type, 'fragment') as memory_type,
                   m.category_id, COALESCE(c.name, '') as category_name, COALESCE(c.color, '') as category_color,
                   COALESCE(m.source, 'ai_extracted') as source,
-                  COALESCE(m.resolution, 1.0) as resolution
+                  COALESCE(m.resolution, 1.0) as resolution,
+                  COALESCE(m.is_permanent, false) as is_permanent
            FROM memories m LEFT JOIN memory_categories c ON m.category_id = c.id
            WHERE COALESCE(m.memory_type, 'fragment') NOT IN ('digested', 'dream_deleted')
              AND (m.valid_until IS NULL OR m.valid_until > NOW())"""
@@ -1635,8 +1660,20 @@ async def get_recent_memories(limit: int = 20, category_id: int = None, project_
         # 必须参数化, 否则 project_id 来自客户端 body, 直接 f-string 拼会被 SQL 注入
         params.append(project_id)
         where_extra += f" AND m.project_id = ${len(params)}"
+    if min_importance is not None:
+        params.append(int(min_importance))
+        where_extra += f" AND m.importance >= ${len(params)}"
+    # 排序
+    order_clause = "ORDER BY m.created_at DESC"
+    if sort == "importance":
+        order_clause = "ORDER BY m.importance DESC, m.created_at DESC"
+    elif sort == "heat":
+        order_clause = "ORDER BY COALESCE(m.access_count, 0) DESC, m.created_at DESC"
     params.append(limit)
-    sql = f"{base_select}{where_extra} ORDER BY m.created_at DESC LIMIT ${len(params)}"
+    limit_idx = len(params)
+    params.append(max(0, int(offset)))
+    offset_idx = len(params)
+    sql = f"{base_select}{where_extra} {order_clause} LIMIT ${limit_idx} OFFSET ${offset_idx}"
     async with pool.acquire() as conn:
         return await conn.fetch(sql, *params)
 
@@ -2552,6 +2589,17 @@ async def save_calendar_page(date_str: str, page_type: str, sections: list, diar
     return row["id"] if row else None
 
 
+def _parse_calendar_jsonb(page: dict) -> dict:
+    """asyncpg 把 JSONB 列当字符串返回——这里把 sections/keywords 解析回 list"""
+    for field in ('sections', 'keywords'):
+        if isinstance(page.get(field), str):
+            try:
+                page[field] = json.loads(page[field])
+            except Exception:
+                page[field] = []
+    return page
+
+
 async def get_calendar_page(date_str: str, page_type: str = "day"):
     """读取指定日期的日历页面"""
     from datetime import date as date_cls
@@ -2563,7 +2611,7 @@ async def get_calendar_page(date_str: str, page_type: str = "day"):
         )
     if not row:
         return None
-    return dict(row)
+    return _parse_calendar_jsonb(dict(row))
 
 
 async def get_calendar_range(start: str, end: str, page_type: str = None):
@@ -2583,7 +2631,7 @@ async def get_calendar_range(start: str, end: str, page_type: str = None):
                 "SELECT * FROM calendar_pages WHERE date >= $1 AND date <= $2 ORDER BY date ASC, type ASC",
                 s, e
             )
-    return [dict(r) for r in rows]
+    return [_parse_calendar_jsonb(dict(r)) for r in rows]
 
 
 async def delete_calendar_page(date_str: str, page_type: str = "day"):
@@ -2925,7 +2973,7 @@ async def mark_memories_dreamed(memory_ids: list):
 
 
 async def soft_delete_memories(memory_ids: list):
-    """软删除记忆（标记为deleted，不真正删除）"""
+    """软删除记忆（标记为deleted，不真正删除）— 锁定记忆永不软删"""
     if not memory_ids:
         return
     pool = await get_pool()
@@ -2933,6 +2981,7 @@ async def soft_delete_memories(memory_ids: list):
         await conn.execute("""
             UPDATE memories SET memory_type = 'dream_deleted'
             WHERE id = ANY($1::int[])
+              AND COALESCE(is_permanent, FALSE) = FALSE
         """, memory_ids)
 
 
@@ -3511,3 +3560,433 @@ async def search_chat_messages(query: str, project_id: str = None, limit: int = 
             "title_matches": title_matches,
             "message_matches": list(results_by_conv.values()),
         }
+
+
+# ============================================================
+# 聊天存档 — 独立文本搜索模块
+# ============================================================
+
+import re as _re
+
+def parse_chat_export(text: str) -> list:
+    """
+    解析导出的 md 聊天记录，返回消息列表。
+    自动检测格式：
+    - 新格式（2026年起）：## User: / ## Assistant: + 'M/D/Y H:M:S' 时间戳 + blockquote 思考链
+    - 旧格式：## Prompt: / ## Response: + 'Y/M/D H:M:S' 时间戳 + 反引号围栏思考链
+    """
+    if _re.search(r'^## (User|Assistant):\s*$', text, flags=_re.MULTILINE):
+        return _parse_new_format(text)
+    return _parse_old_format(text)
+
+
+def _parse_new_format(text: str) -> list:
+    """新格式：## User: / ## Assistant: + > 时间戳 + 可选 > 思考链 blockquote + 正文"""
+    blocks = _re.split(r'^## (User|Assistant):\s*$', text, flags=_re.MULTILINE)
+    messages = []
+    i = 1
+    while i < len(blocks) - 1:
+        marker = blocks[i].strip()
+        body = blocks[i + 1]
+        role = "human" if marker == "User" else "assistant"
+
+        lines = body.split('\n')
+        idx = 0
+        # 跳过前导空行
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx >= len(lines):
+            i += 2
+            continue
+
+        # 解析 '> M/D/Y H:M:S' 时间戳
+        ts_line = lines[idx].strip()
+        ts = None
+        if ts_line.startswith('>'):
+            ts_str = ts_line[1:].strip()
+            try:
+                ts = datetime.strptime(ts_str, "%m/%d/%Y %H:%M:%S")
+                ts = ts.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        if ts is None:
+            i += 2
+            continue
+        idx += 1
+
+        # 跳过空行
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+
+        # Assistant 可能有思考链 blockquote
+        thinking = None
+        if role == "assistant" and idx < len(lines) and lines[idx].strip().startswith('>'):
+            thinking_lines = []
+            while idx < len(lines):
+                s = lines[idx].strip()
+                if s.startswith('>'):
+                    inner = s[1:]
+                    if inner.startswith(' '):
+                        inner = inner[1:]
+                    thinking_lines.append(inner)
+                    idx += 1
+                else:
+                    break
+            thinking = '\n'.join(thinking_lines).strip() or None
+            while idx < len(lines) and not lines[idx].strip():
+                idx += 1
+
+        content = '\n'.join(lines[idx:]).strip()
+        if not content and not thinking:
+            i += 2
+            continue
+
+        messages.append({
+            "role": role,
+            "content": content,
+            "thinking": thinking,
+            "message_ts": ts,
+        })
+        i += 2
+    return messages
+
+
+def _parse_old_format(text: str) -> list:
+    """旧格式：## Prompt: / ## Response: + Y/M/D 时间戳 + 反引号围栏思考链"""
+    blocks = _re.split(r'^(?:#{1,3}\s+)?(Prompt:|Response:)\s*$', text, flags=_re.MULTILINE)
+
+    messages = []
+    i = 1
+    while i < len(blocks) - 1:
+        marker = blocks[i].strip()
+        body = blocks[i + 1]
+
+        role = "human" if marker == "Prompt:" else "assistant"
+        lines = body.strip().split("\n", 1)
+        ts_str = lines[0].strip()
+        raw_content = lines[1] if len(lines) > 1 else ""
+
+        try:
+            ts = datetime.strptime(ts_str, "%Y/%m/%d %H:%M:%S")
+            ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            i += 2
+            continue
+
+        thinking = None
+        content = raw_content
+        if role == "assistant":
+            thinking_parts = []
+            def _collect_thinking(m):
+                thinking_parts.append(m.group(1).strip())
+                return ""
+            # 支持 3 或 4 个反引号的围栏（Claude 导出用 4 个）
+            content = _re.sub(
+                r"`{3,4}(?:plaintext|thinking)\s*\n(.*?)`{3,4}",
+                _collect_thinking, content, flags=_re.DOTALL,
+            )
+            if thinking_parts:
+                thinking = "\n\n".join(thinking_parts)
+
+        content = content.strip()
+        if not content and not thinking:
+            i += 2
+            continue
+
+        messages.append({
+            "role": role,
+            "content": content,
+            "thinking": thinking,
+            "message_ts": ts,
+        })
+        i += 2
+
+    return messages
+
+
+def extract_archive_title(text: str) -> str:
+    """从 md 文件头提取标题。优先用 '# 标题' 行，没有就返回 'untitled'"""
+    for line in text.splitlines()[:20]:
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("##"):
+            title = stripped[2:].strip()
+            if title:
+                # 限制长度，去掉特殊字符
+                return title[:80]
+    return "untitled"
+
+
+async def import_chat_archive(text: str, source: str = None) -> dict:
+    """
+    按 source（对话窗口）替换性导入聊天记录。
+    - 如果传了 source，只清空该 source 的旧数据
+    - 如果没传 source，从文件头 '# 标题' 自动提取
+    返回统计
+    """
+    messages = parse_chat_export(text)
+    if not messages:
+        return {"error": "未解析到任何消息，请检查文件格式"}
+
+    if not source or not source.strip():
+        source = extract_archive_title(text)
+    source = source.strip()[:80]
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 只清空该 source 的旧数据，其他对话不动
+        await conn.execute("DELETE FROM chat_archive WHERE source = $1", source)
+        for msg in messages:
+            await conn.execute(
+                """INSERT INTO chat_archive (role, content, thinking, message_ts, source)
+                   VALUES ($1, $2, $3, $4, $5)""",
+                msg["role"], msg["content"], msg["thinking"], msg["message_ts"], source,
+            )
+
+    human_count = sum(1 for m in messages if m["role"] == "human")
+    assistant_count = sum(1 for m in messages if m["role"] == "assistant")
+    thinking_count = sum(1 for m in messages if m["thinking"])
+    return {
+        "status": "imported",
+        "source": source,
+        "total": len(messages),
+        "human": human_count,
+        "assistant": assistant_count,
+        "with_thinking": thinking_count,
+    }
+
+
+def _extract_snippet(text: str, keywords: list, max_len: int = 200) -> str:
+    """围绕关键词截取片段"""
+    if len(text) <= max_len:
+        return text
+
+    pos = -1
+    for kw in keywords:
+        idx = text.lower().find(kw.lower())
+        if idx != -1:
+            pos = idx
+            break
+
+    if pos == -1:
+        return text[:max_len] + "…"
+
+    half = max_len // 2
+    start = max(0, pos - half)
+    end = min(len(text), start + max_len)
+    if end - start < max_len:
+        start = max(0, end - max_len)
+
+    snippet = text[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
+async def search_chat_archive(
+    query: str,
+    include_thinking: bool = False,
+    limit: int = 5,
+    snippet_len: int = 200,
+    source: str = None,
+) -> list:
+    """
+    关键词搜索聊天存档。
+    - source=None: 跨所有窗口搜
+    - source='xxx': 只搜指定窗口
+    """
+    keywords = [k for k in query.split() if k]
+    if not keywords:
+        return []
+
+    conditions = []
+    params = []
+    for kw in keywords:
+        idx = len(params) + 1
+        if include_thinking:
+            conditions.append(f"(content ILIKE ${idx} OR thinking ILIKE ${idx})")
+        else:
+            conditions.append(f"content ILIKE ${idx}")
+        params.append(f"%{kw}%")
+
+    if source and source.strip():
+        idx = len(params) + 1
+        conditions.append(f"source = ${idx}")
+        params.append(source.strip())
+
+    where = " AND ".join(conditions)
+    params.append(limit)
+
+    sql = f"""SELECT id, role, content, thinking, message_ts, source
+              FROM chat_archive
+              WHERE {where}
+              ORDER BY message_ts DESC
+              LIMIT ${len(params)}"""
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    results = []
+    for row in rows:
+        text = row["content"]
+        matched_in = "content"
+        if include_thinking and row["thinking"]:
+            content_matches = all(kw.lower() in text.lower() for kw in keywords)
+            thinking_matches = all(kw.lower() in row["thinking"].lower() for kw in keywords)
+            if thinking_matches and not content_matches:
+                text = row["thinking"]
+                matched_in = "thinking"
+
+        results.append({
+            "id": row["id"],
+            "role": row["role"],
+            "date": str(row["message_ts"])[:16],
+            "matched_in": matched_in,
+            "source": row["source"],
+            "snippet": _extract_snippet(text, keywords, snippet_len),
+        })
+
+    return results
+
+
+# ============================================================
+# Token 估算 — 用于对话窗口健康度
+# ============================================================
+# 经验值：中文 1 字 ≈ 0.7 token，英文 1 char ≈ 0.25 token。
+# 我们用保守估计：所有字符按 0.6 算（偏高一点，给压缩预警留余量）。
+# 200K 是 Claude 桌面端默认上下文窗口的容量。
+
+DEFAULT_CONTEXT_LIMIT = 500_000  # tokens — Claude 桌面实际有效窗口（保守估计，根据观测调）
+TOKEN_PER_CHAR = 1.0  # 中文为主的对话 ~1 token/char
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估算 token 数（保守偏高）"""
+    if not text:
+        return 0
+    return int(len(text) * TOKEN_PER_CHAR)
+
+
+def health_status(usage_pct: float) -> str:
+    """根据上下文占用比例返回状态"""
+    if usage_pct < 50:
+        return "healthy"     # 绿
+    elif usage_pct < 70:
+        return "warm"        # 黄
+    elif usage_pct < 85:
+        return "warning"     # 橙
+    else:
+        return "critical"    # 红
+
+
+async def get_chat_archive_stats(context_limit: int = None) -> dict:
+    """存档统计：总量 + 每个 source 的明细 + 健康度指标"""
+    # 上下文容量 + 工具开销系数都从 DB 配置读
+    overhead_factor = 1.3
+    if context_limit is None:
+        try:
+            from config import get_config
+            cfg_val = await get_config("archive_context_limit")
+            context_limit = int(cfg_val) if cfg_val else DEFAULT_CONTEXT_LIMIT
+            of_val = await get_config("archive_overhead_factor")
+            overhead_factor = float(of_val) if of_val else 1.3
+        except Exception:
+            context_limit = DEFAULT_CONTEXT_LIMIT
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM chat_archive")
+        if total == 0:
+            return {"total": 0, "sources": [], "context_limit": context_limit}
+        date_range = await conn.fetchrow(
+            "SELECT MIN(message_ts) as earliest, MAX(message_ts) as latest FROM chat_archive"
+        )
+        # 用 SQL 直接聚合字符数，比拉所有内容到 Python 快
+        source_rows = await conn.fetch("""
+            SELECT source,
+                   COUNT(*) as count,
+                   SUM(LENGTH(content)) as content_chars,
+                   SUM(LENGTH(COALESCE(thinking, ''))) as thinking_chars,
+                   MIN(message_ts) as earliest,
+                   MAX(message_ts) as latest
+            FROM chat_archive
+            GROUP BY source
+            ORDER BY MAX(message_ts) DESC
+        """)
+        sources = []
+        for r in source_rows:
+            chars = (r["content_chars"] or 0) + (r["thinking_chars"] or 0)
+            content_tokens = int(chars * TOKEN_PER_CHAR)
+            est_tokens = int(content_tokens * overhead_factor)
+            usage_pct = round(est_tokens / context_limit * 100, 1) if context_limit else 0
+            # 活动天数 / 平均速率
+            earliest = r["earliest"]
+            latest = r["latest"]
+            days = max(1, (latest - earliest).days + 1) if (earliest and latest) else 1
+            msgs_per_day = round(r["count"] / days, 1)
+            sources.append({
+                "source": r["source"],
+                "count": r["count"],
+                "earliest": str(earliest)[:10] if earliest else None,
+                "latest": str(latest)[:10] if latest else None,
+                "chars": chars,
+                "content_tokens": content_tokens,
+                "est_tokens": est_tokens,
+                "context_limit": context_limit,
+                "overhead_factor": overhead_factor,
+                "usage_pct": usage_pct,
+                "status": health_status(usage_pct),
+                "days_active": days,
+                "msgs_per_day": msgs_per_day,
+            })
+        return {
+            "total": total,
+            "earliest": str(date_range["earliest"])[:10] if date_range["earliest"] else None,
+            "latest": str(date_range["latest"])[:10] if date_range["latest"] else None,
+            "context_limit": context_limit,
+            "overhead_factor": overhead_factor,
+            "sources": sources,
+        }
+
+
+async def delete_chat_archive_source(source: str) -> int:
+    """删除某个 source 的所有存档，返回删除条数"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM chat_archive WHERE source = $1", source)
+        try:
+            return int(result.split(" ")[-1])
+        except (ValueError, IndexError):
+            return 0
+
+
+async def rename_chat_archive_source(old_source: str, new_source: str) -> dict:
+    """
+    重命名某个对话窗口（更新 source 字段）
+    - 如果 new_source 已存在，会合并到该窗口下
+    返回 {updated: 条数, merged: bool}
+    """
+    old_source = (old_source or "").strip()
+    new_source = (new_source or "").strip()[:80]
+    if not old_source or not new_source:
+        return {"error": "source 不能为空"}
+    if old_source == new_source:
+        return {"updated": 0, "merged": False, "note": "新旧名称相同，未做修改"}
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 检查新名称是否已存在
+        existing = await conn.fetchval(
+            "SELECT COUNT(*) FROM chat_archive WHERE source = $1", new_source
+        )
+        merged = existing > 0
+        result = await conn.execute(
+            "UPDATE chat_archive SET source = $1 WHERE source = $2",
+            new_source, old_source,
+        )
+        try:
+            updated = int(result.split(" ")[-1])
+        except (ValueError, IndexError):
+            updated = 0
+        return {"updated": updated, "merged": merged}
