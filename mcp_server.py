@@ -637,7 +637,9 @@ async def get_user_profile() -> str:
             resp = await client.get(f"{GATEWAY_BASE}/admin/config")
             data = resp.json()
 
-        profile = data.get("user_profile", {}).get("value", "")
+        # /admin/config 返回 {status, config: {key: {value, ...}}},要先剥 config 这层
+        cfg = data.get("config", data)
+        profile = cfg.get("user_profile", {}).get("value", "")
         if not profile:
             return "暂无用户画像。"
 

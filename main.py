@@ -902,12 +902,19 @@ async def api_status():
 
 @app.get("/admin")
 async def admin_panel():
-    """管理面板"""
+    """管理面板 — 加 no-cache 头,避免浏览器缓存旧版本"""
     import pathlib
     html_path = pathlib.Path(__file__).parent / "admin-panel" / "index.html"
     if html_path.exists():
         from fastapi.responses import HTMLResponse
-        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            content=html_path.read_text(encoding="utf-8"),
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
     return {"message": "管理面板文件不存在，请确认 admin-panel/index.html 已部署"}
 
 

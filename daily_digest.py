@@ -430,7 +430,7 @@ async def update_user_profile(digest_text: str = None, model_override: str = Non
                 },
                 json={
                     "model": use_model,
-                    "max_tokens": 2000,
+                    "max_tokens": 6000,  # 中文画像 ~3300 字符需要 ~3500 tokens,给足余量避免截断
                     "messages": [
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": "请根据今天的日志更新用户画像。"},
