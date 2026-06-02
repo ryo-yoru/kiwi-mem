@@ -603,7 +603,26 @@ async def init_tables():
             CREATE INDEX IF NOT EXISTS idx_chat_archive_source ON chat_archive(source);
         """)
 
-    print("✅ 数据库表结构已就绪（v6.2 多源聊天存档）")
+        # v6.4 迁移：日页面加 source 列，支持一天多个窗口各写一片
+        await conn.execute("""
+            ALTER TABLE calendar_pages ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';
+        """)
+        # 唯一约束从 (date,type) 升级到 (date,type,source)
+        await conn.execute("""
+            ALTER TABLE calendar_pages DROP CONSTRAINT IF EXISTS calendar_pages_date_type_key;
+        """)
+        await conn.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'calendar_pages_date_type_source_key'
+                ) THEN
+                    ALTER TABLE calendar_pages
+                        ADD CONSTRAINT calendar_pages_date_type_source_key UNIQUE (date, type, source);
+                END IF;
+            END $$;
+        """)
+
+    print("✅ 数据库表结构已就绪（v6.4 多源日页面）")
 
 
 # ============================================================
@@ -2614,18 +2633,23 @@ async def fire_reminder(rid: str, repeat_type: str, repeat_config: dict = None) 
 
 async def save_calendar_page(date_str: str, page_type: str, sections: list, diary: str = "",
                               keywords: list = None, model_used: str = "", summary: str = "", digest: str = "",
-                              title: str = ""):
-    """保存或更新日历页面（upsert），v5.4 summary / v5.5 digest / v6.0 title"""
+                              title: str = "", source: str = ""):
+    """
+    保存或更新日历页面（upsert），v5.4 summary / v5.5 digest / v6.0 title / v6.4 source
+    source = 窗口名（如 "寅" / "益"）。同一天不同 source 各存一片，互不覆盖；
+    source 留空 = 沿用旧的单片行为。
+    """
     from datetime import date as date_cls
     pool = await get_pool()
     d = date_cls.fromisoformat(date_str)
     kw = json.dumps(keywords or [], ensure_ascii=False)
     sec = json.dumps(sections, ensure_ascii=False)
+    src = (source or "").strip()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO calendar_pages (date, type, sections, diary, keywords, model_used, summary, digest, title, updated_at)
-            VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7, $8, $9, NOW())
-            ON CONFLICT (date, type) DO UPDATE SET
+            INSERT INTO calendar_pages (date, type, source, sections, diary, keywords, model_used, summary, digest, title, updated_at)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, NOW())
+            ON CONFLICT (date, type, source) DO UPDATE SET
                 sections = EXCLUDED.sections,
                 diary = EXCLUDED.diary,
                 keywords = EXCLUDED.keywords,
@@ -2635,7 +2659,7 @@ async def save_calendar_page(date_str: str, page_type: str, sections: list, diar
                 title = EXCLUDED.title,
                 updated_at = NOW()
             RETURNING id
-        """, d, page_type, sec, diary, kw, model_used, summary, digest, title)
+        """, d, page_type, src, sec, diary, kw, model_used, summary, digest, title)
     return row["id"] if row else None
 
 
@@ -2650,15 +2674,26 @@ def _parse_calendar_jsonb(page: dict) -> dict:
     return page
 
 
-async def get_calendar_page(date_str: str, page_type: str = "day"):
-    """读取指定日期的日历页面"""
+async def get_calendar_page(date_str: str, page_type: str = "day", source: str = None):
+    """
+    读取指定日期的日历页面。
+    source 指定时只读那个窗口那片（省上下文）；
+    source 为 None 时返回该日该类型的第一片（兼容旧单片逻辑）。
+    """
     from datetime import date as date_cls
     pool = await get_pool()
     d = date_cls.fromisoformat(date_str)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM calendar_pages WHERE date = $1 AND type = $2", d, page_type
-        )
+        if source is not None:
+            row = await conn.fetchrow(
+                "SELECT * FROM calendar_pages WHERE date = $1 AND type = $2 AND source = $3",
+                d, page_type, source.strip()
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT * FROM calendar_pages WHERE date = $1 AND type = $2 ORDER BY source ASC LIMIT 1",
+                d, page_type
+            )
     if not row:
         return None
     return _parse_calendar_jsonb(dict(row))
@@ -2684,25 +2719,37 @@ async def get_calendar_range(start: str, end: str, page_type: str = None):
     return [_parse_calendar_jsonb(dict(r)) for r in rows]
 
 
-async def delete_calendar_page(date_str: str, page_type: str = "day"):
-    """删除指定日期的日历页面（同时删除关联评论）"""
+async def delete_calendar_page(date_str: str, page_type: str = "day", source: str = None):
+    """
+    删除日历页面（同时删除关联评论）。
+    source 指定时只删那一片；为 None 时删该日该类型的所有片。
+    """
     from datetime import date as date_cls
     pool = await get_pool()
     d = date_cls.fromisoformat(date_str)
     async with pool.acquire() as conn:
-        # 先查出 page id，用于删评论
-        row = await conn.fetchrow(
-            "SELECT id FROM calendar_pages WHERE date = $1 AND type = $2", d, page_type
-        )
-        if row:
-            # 删除关联评论
-            await conn.execute(
-                "DELETE FROM comments WHERE target_type = 'calendar_page' AND target_id = $1", row['id']
+        if source is not None:
+            rows = await conn.fetch(
+                "SELECT id FROM calendar_pages WHERE date = $1 AND type = $2 AND source = $3",
+                d, page_type, source.strip()
             )
-        # 删除页面
-        result = await conn.execute(
-            "DELETE FROM calendar_pages WHERE date = $1 AND type = $2", d, page_type
-        )
+        else:
+            rows = await conn.fetch(
+                "SELECT id FROM calendar_pages WHERE date = $1 AND type = $2", d, page_type
+            )
+        for r in rows:
+            await conn.execute(
+                "DELETE FROM comments WHERE target_type = 'calendar_page' AND target_id = $1", r['id']
+            )
+        if source is not None:
+            result = await conn.execute(
+                "DELETE FROM calendar_pages WHERE date = $1 AND type = $2 AND source = $3",
+                d, page_type, source.strip()
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM calendar_pages WHERE date = $1 AND type = $2", d, page_type
+            )
     return "DELETE" in result
 
 

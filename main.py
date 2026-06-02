@@ -2470,11 +2470,11 @@ async def api_generate_month_summary(month: str = None):
 
 
 @app.get("/calendar/{date}")
-async def api_get_calendar_day(date: str, type: str = "day"):
-    """获取指定日期的日历页面"""
+async def api_get_calendar_day(date: str, type: str = "day", source: str = None):
+    """获取指定日期的日历页面。source 指定时只取那个窗口那片"""
     try:
         from database import get_calendar_page
-        page = await get_calendar_page(date, type)
+        page = await get_calendar_page(date, type, source=source)
         if not page:
             return {"status": "ok", "page": None}
         # 序列化 date 对象
@@ -2524,6 +2524,7 @@ async def api_save_calendar_page(date: str, req: Request):
         content = body.get("content", "")
         title = body.get("title", "")
         page_type = body.get("type", "day")
+        source = body.get("source", "")  # 窗口名，如 "寅"/"益"；空=单片
         # 用户编辑的内容存入 diary 字段，sections 留空（用户不走分段逻辑）
         page_id = await save_calendar_page(
             date_str=date,
@@ -2535,6 +2536,7 @@ async def api_save_calendar_page(date: str, req: Request):
             summary="",
             digest="",
             title=title,
+            source=source,
         )
         return {"status": "ok", "id": page_id}
     except Exception as e:
@@ -2542,11 +2544,11 @@ async def api_save_calendar_page(date: str, req: Request):
 
 
 @app.delete("/admin/calendar/{date}")
-async def api_delete_calendar_page(date: str, type: str = "day"):
-    """删除指定日期的日历页面"""
+async def api_delete_calendar_page(date: str, type: str = "day", source: str = None):
+    """删除日历页面。source 指定时只删那一片,不指定删该日全部"""
     try:
         from database import delete_calendar_page
-        ok = await delete_calendar_page(date, type)
+        ok = await delete_calendar_page(date, type, source=source)
         return {"status": "ok" if ok else "not_found"}
     except Exception as e:
         return {"error": str(e)}
@@ -3794,6 +3796,7 @@ async def api_sync_export():
                 diary = p.get("diary") or ""
                 summary = p.get("summary") or ""
                 digest = p.get("digest") or ""
+                source = p.get("source") or ""
                 keywords = p.get("keywords") or []
                 if isinstance(keywords, str):
                     try:
@@ -3805,6 +3808,8 @@ async def api_sync_export():
                 fm_lines = ["---"]
                 fm_lines.append(f"date: {date_str}")
                 fm_lines.append(f"type: {ptype}")
+                if source:
+                    fm_lines.append(f"window: {source}")
                 if title:
                     fm_lines.append(f"title: {title}")
                 if keywords:
@@ -3819,9 +3824,10 @@ async def api_sync_export():
                 fm_lines.append(body)
                 md_content = "\n".join(fm_lines)
 
-                # 按类型放进不同目录
+                # 按类型放进不同目录;同一天多窗口用 {date}-{窗口名} 区分,避免覆盖
                 folder = {"day": "day-pages", "week": "week-pages", "month": "month-pages"}.get(ptype, "pages")
-                zf.writestr(f"{folder}/{date_str}.md", md_content)
+                fname = f"{date_str}-{source}.md" if source else f"{date_str}.md"
+                zf.writestr(f"{folder}/{fname}", md_content)
         buf.seek(0)
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")

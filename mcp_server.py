@@ -377,13 +377,15 @@ mcp_calendar = FastMCP("Calendar & Dream", stateless_http=True)
 # ---- 日历页面 ----
 
 @mcp_calendar.tool()
-async def get_day_page(date: str, type: str = "day") -> str:
+async def get_day_page(date: str, type: str = "day", source: str = "") -> str:
     """
     查看某一天的日历页面（日记/周总结/月总结等）。
 
     参数：
     - date: 日期，格式 YYYY-MM-DD，如 "2026-04-14"
     - type: 页面类型，可选 day/week/month/quarter/year（默认 day）
+    - source: 你的窗口名（如 "寅"/"益"）。只读你自己写的那一片，省上下文、
+              不必加载别的窗口的内容。留空则返回该日第一片。
 
     返回这一天的标题、内容概要、时段详情和 AI 日记。
     """
@@ -392,9 +394,12 @@ async def get_day_page(date: str, type: str = "day") -> str:
 
     try:
         async with httpx.AsyncClient(timeout=15, headers=GATEWAY_HEADERS) as client:
+            params = {"type": type}
+            if source.strip():
+                params["source"] = source.strip()
             resp = await client.get(
                 f"{GATEWAY_BASE}/calendar/{date.strip()}",
-                params={"type": type},
+                params=params,
             )
             data = resp.json()
 
@@ -495,7 +500,7 @@ async def get_calendar_range(start: str, end: str, type: str = "") -> str:
 
 
 @mcp_calendar.tool()
-async def save_calendar_page(date: str, content: str, title: str = "", type: str = "day") -> str:
+async def save_calendar_page(date: str, content: str, title: str = "", type: str = "day", source: str = "") -> str:
     """
     写入或更新日历页面（日记）。
 
@@ -504,6 +509,8 @@ async def save_calendar_page(date: str, content: str, title: str = "", type: str
     - content: 正文内容（Markdown 格式）
     - title: 标题（可选）
     - type: 页面类型，day/week/month/quarter/year（默认 day）
+    - source: 你的窗口名（如 "寅"/"益"）。多个窗口同一天各写各的日页面、互不覆盖。
+              留空则沿用单片模式。建议每个窗口固定用自己的名字。
 
     用于 AI 在对话中为用户写日记、补充周记等。
     """
@@ -520,6 +527,7 @@ async def save_calendar_page(date: str, content: str, title: str = "", type: str
                     "content": content.strip(),
                     "title": title.strip(),
                     "type": type.strip(),
+                    "source": source.strip(),
                 },
             )
             data = resp.json()

@@ -135,7 +135,7 @@ textarea{resize:vertical;}
 
 /* Modal */
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center;z-index:100;animation:fadeIn 0.15s;}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;width:580px;max-height:85vh;overflow-y:auto;box-shadow:0 8px 30px rgba(0,0,0,0.12);}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;width:min(900px,92vw);max-height:85vh;overflow-y:auto;box-shadow:0 8px 30px rgba(0,0,0,0.12);}
 .modal h3{font-size:15px;font-weight:500;margin-bottom:12px;}
 .modal label{font-size:11px;color:var(--text-3);display:block;margin-bottom:2px;margin-top:10px;}
 
@@ -232,21 +232,8 @@ textarea{resize:vertical;}
   </div>
   <div class="date-grid" id="cal-date-bar"></div>
   <div id="cal-viewer" class="card hidden">
-    <div class="flex-between" style="margin-bottom:8px;">
-      <h3 id="cal-viewer-title" style="font-size:14px;font-weight:500;"></h3>
-      <div style="display:flex;gap:4px;">
-        <button class="btn btn-sm btn-secondary" id="cal-edit-toggle" onclick="toggleCalEdit()">编辑</button>
-        <button class="btn btn-sm btn-danger" onclick="delDayPage()">删除</button>
-      </div>
-    </div>
-    <div id="cal-preview" class="day-content"></div>
-    <div id="cal-edit-area" class="hidden">
-      <textarea id="cal-editor" rows="16" style="font-size:13px;line-height:1.7;margin-bottom:8px;"></textarea>
-      <div style="display:flex;gap:5px;justify-content:flex-end;">
-        <button class="btn btn-secondary" onclick="toggleCalEdit()">取消</button>
-        <button class="btn btn-primary" onclick="saveDayPage()">保存</button>
-      </div>
-    </div>
+    <h3 id="cal-viewer-title" style="font-size:14px;font-weight:500;margin-bottom:4px;"></h3>
+    <div id="cal-pages"></div>
   </div>
 </div>
 
@@ -605,7 +592,7 @@ function editMemory(id){
   apiJson('/debug/memories?limit=200').then(data=>{
     const m=(data.results||[]).find(x=>x.id===id);if(!m){toast('找不到',false);return;}
     const bg=document.createElement('div');bg.className='modal-bg';
-    bg.innerHTML=`<div class="modal"><h3>编辑记忆 #${m.id}</h3><label>标题</label><input type="text" id="em-title" value="${escA(m.title||'')}"><label>内容</label><textarea id="em-content" rows="5">${esc(m.content||'')}</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;"><div><label>重要度</label><input type="number" id="em-imp" min="1" max="10" value="${m.importance||5}"></div><div><label>创建时间</label><input type="datetime-local" id="em-date" value="${(m.created_at||'').slice(0,16)}"></div></div><div style="display:flex;gap:5px;justify-content:flex-end;margin-top:12px;"><button class="btn btn-secondary" onclick="this.closest('.modal-bg').remove()">取消</button><button class="btn btn-primary" onclick="saveMemEdit(${m.id})">保存</button></div></div>`;
+    bg.innerHTML=`<div class="modal"><h3>编辑记忆 #${m.id}</h3><label>标题</label><input type="text" id="em-title" value="${escA(m.title||'')}"><label>内容</label><textarea id="em-content" rows="12">${esc(m.content||'')}</textarea><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;"><div><label>重要度</label><input type="number" id="em-imp" min="1" max="10" value="${m.importance||5}"></div><div><label>创建时间</label><input type="datetime-local" id="em-date" value="${(m.created_at||'').slice(0,16)}"></div></div><div style="display:flex;gap:5px;justify-content:flex-end;margin-top:12px;"><button class="btn btn-secondary" onclick="this.closest('.modal-bg').remove()">取消</button><button class="btn btn-primary" onclick="saveMemEdit(${m.id})">保存</button></div></div>`;
     document.body.appendChild(bg);
   });
 }
@@ -632,37 +619,77 @@ async function loadCalendar(){
   }catch(e){document.getElementById('cal-date-bar').innerHTML=`<p style="color:var(--red)">加载失败</p>`;}
 }
 function renderCalDateGrid(){
-  document.getElementById('cal-date-bar').innerHTML=calPages.map(p=>{
-    const preview=(p.diary||p.digest||p.summary||'').replace(/\n/g,' ').slice(0,20);
-    return `<div class="date-block ${calSelected===p.date?'active':''}" onclick="selectCalPage('${p.date}')"><div class="db-date">${p.date.slice(5)}</div><div class="db-preview">${esc(preview)||'...'}</div></div>`;
+  // 按日期分组(一天可能多片),日期格子去重
+  const byDate={};
+  calPages.forEach(p=>{(byDate[p.date]=byDate[p.date]||[]).push(p);});
+  const dates=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+  document.getElementById('cal-date-bar').innerHTML=dates.map(date=>{
+    const pages=byDate[date];
+    const preview=(pages[0].diary||pages[0].digest||pages[0].summary||'').replace(/\n/g,' ').slice(0,18);
+    const badge=pages.length>1?`<span style="color:var(--accent)"> ·${pages.length}片</span>`:'';
+    return `<div class="date-block ${calSelected===date?'active':''}" onclick="selectCalPage('${date}')"><div class="db-date">${date.slice(5)}${badge}</div><div class="db-preview">${esc(preview)||'...'}</div></div>`;
   }).join('');
 }
+let calDayPages=[];
 function selectCalPage(date){
-  calSelected=date;calEditing=false;renderCalDateGrid();
-  const page=calPages.find(p=>p.date===date);
+  calSelected=date;renderCalDateGrid();
+  // 该日所有片,按窗口名排序
+  calDayPages=calPages.filter(p=>p.date===date).sort((a,b)=>(a.source||'').localeCompare(b.source||''));
   document.getElementById('cal-viewer').classList.remove('hidden');
   document.getElementById('cal-viewer-title').textContent=date;
-  document.getElementById('cal-edit-area').classList.add('hidden');
-  document.getElementById('cal-preview').classList.remove('hidden');
-  document.getElementById('cal-edit-toggle').textContent='编辑';
-  if(page){
-    const c=page.diary||page.digest||page.summary||'(无内容)';
-    document.getElementById('cal-preview').innerHTML=renderMd(c);
-    document.getElementById('cal-editor').value=c;
-  }else{document.getElementById('cal-preview').innerHTML='<p style="color:var(--text-3)">(无内容)</p>';}
+  renderCalPages();
 }
-function toggleCalEdit(){
-  calEditing=!calEditing;
-  document.getElementById('cal-preview').classList.toggle('hidden',calEditing);
-  document.getElementById('cal-edit-area').classList.toggle('hidden',!calEditing);
-  document.getElementById('cal-edit-toggle').textContent=calEditing?'预览':'编辑';
-  if(!calEditing)document.getElementById('cal-preview').innerHTML=renderMd(document.getElementById('cal-editor').value);
+function renderCalPages(){
+  const html=calDayPages.map((p,i)=>{
+    const src=p.source||'';
+    const label=src?`窗口 · ${esc(src)}`:'未命名窗口';
+    const c=p.diary||p.digest||p.summary||'(无内容)';
+    return `
+    <div style="border-top:1px solid var(--border-light);padding-top:10px;margin-top:10px;">
+      <div class="flex-between" style="margin-bottom:6px;">
+        <span style="font-weight:500;color:var(--accent);font-size:12.5px;">${label}</span>
+        <div style="display:flex;gap:4px;">
+          <button class="btn btn-sm btn-secondary" id="cal-toggle-${i}" onclick="toggleCalEditBlock(${i})">编辑</button>
+          <button class="btn btn-sm btn-danger" onclick="delDayPageBlock(${i})">删除</button>
+        </div>
+      </div>
+      <div id="cal-preview-${i}" class="day-content">${renderMd(c)}</div>
+      <div id="cal-edit-${i}" class="hidden">
+        <textarea id="cal-editor-${i}" rows="14" style="font-size:13px;line-height:1.7;margin-bottom:8px;">${esc(c)}</textarea>
+        <div style="display:flex;gap:5px;justify-content:flex-end;">
+          <button class="btn btn-secondary" onclick="toggleCalEditBlock(${i})">取消</button>
+          <button class="btn btn-primary" onclick="saveDayPageBlock(${i})">保存</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('cal-pages').innerHTML=html||'<p style="color:var(--text-3)">(无内容)</p>';
 }
-async function saveDayPage(){
-  if(!calSelected)return;
-  try{await api(`/admin/calendar/${calSelected}`,{method:'PUT',body:JSON.stringify({content:document.getElementById('cal-editor').value,type:'day'})});toast('已保存');calEditing=false;loadCalendar();}catch(e){toast('保存失败',false);}
+function toggleCalEditBlock(i){
+  const pv=document.getElementById('cal-preview-'+i),ed=document.getElementById('cal-edit-'+i),btn=document.getElementById('cal-toggle-'+i);
+  const editing=!ed.classList.contains('hidden');
+  if(editing){
+    pv.innerHTML=renderMd(document.getElementById('cal-editor-'+i).value);
+    pv.classList.remove('hidden');ed.classList.add('hidden');btn.textContent='编辑';
+  }else{
+    pv.classList.add('hidden');ed.classList.remove('hidden');btn.textContent='预览';
+  }
 }
-async function delDayPage(){if(!calSelected||!confirm(`确定删除 ${calSelected} 的日页面?`))return;try{await api(`/admin/calendar/${calSelected}?type=day`,{method:'DELETE'});toast('已删除');calSelected=null;document.getElementById('cal-viewer').classList.add('hidden');loadCalendar();}catch(e){toast('删除失败',false);}}
+async function saveDayPageBlock(i){
+  const p=calDayPages[i];if(!p)return;
+  const body={content:document.getElementById('cal-editor-'+i).value,type:'day',source:p.source||''};
+  try{await api(`/admin/calendar/${p.date}`,{method:'PUT',body:JSON.stringify(body)});toast('已保存');loadCalendar();}catch(e){toast('保存失败',false);}
+}
+async function delDayPageBlock(i){
+  const p=calDayPages[i];if(!p)return;
+  const label=p.source?`「${p.source}」`:'';
+  if(!confirm(`确定删除 ${p.date} ${label}这片日页面?`))return;
+  try{
+    // 始终带 source(含空)只删这一片,不会误删整天
+    await api(`/admin/calendar/${p.date}?type=day&source=${encodeURIComponent(p.source||'')}`,{method:'DELETE'});
+    toast('已删除');loadCalendar();
+  }catch(e){toast('删除失败',false);}
+}
 function queryDayPage(){
   const date=document.getElementById('cal-query-date').value;if(!date){toast('请选择日期',false);return;}
   // 如果已在列表中直接跳过去,否则请求单日数据
