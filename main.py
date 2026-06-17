@@ -185,11 +185,31 @@ async def get_active_system_prompt() -> str:
 # 应用生命周期管理
 # ============================================================
 
+async def _embedding_backfill_worker():
+    """每 5 分钟扫一次缺 embedding 的记忆,自动补全。
+
+    save_memory 写入时若 embedding API 抽风,记忆照存但 embedding 列留 NULL。
+    这个 worker 周期性把 NULL 的补上,免得朝朝一直手动按 /admin/migrate-embeddings。
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)
+            result = await migrate_embeddings()
+            migrated = result.get("migrated", 0) if isinstance(result, dict) else 0
+            if migrated > 0:
+                print(f"🔄 auto-backfill: 自动补了 {migrated} 条 embedding")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️  embedding 自动补全失败: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时初始化数据库和MCP，关闭时断开连接"""
     digest_task = None
     dream_check_task = None
+    embedding_backfill_task = None
     
     if MEMORY_ENABLED:
         try:
@@ -219,7 +239,10 @@ async def lifespan(app: FastAPI):
             # 启动自动 Dream 检查器（每小时检查24h无活动）
             from dream import auto_dream_scheduler
             dream_check_task = asyncio.create_task(auto_dream_scheduler())
-            
+
+            # 启动 embedding 自动补全 worker
+            embedding_backfill_task = asyncio.create_task(_embedding_backfill_worker())
+
         except Exception as e:
             print(f"⚠️  数据库初始化失败: {e}")
             print("⚠️  记忆系统将不可用，但网关仍可正常转发")
@@ -236,6 +259,8 @@ async def lifespan(app: FastAPI):
         digest_task.cancel()
     if dream_check_task:
         dream_check_task.cancel()
+    if embedding_backfill_task:
+        embedding_backfill_task.cancel()
     if MEMORY_ENABLED:
         await close_pool()
 
